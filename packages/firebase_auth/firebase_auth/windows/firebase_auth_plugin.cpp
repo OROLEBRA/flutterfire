@@ -26,10 +26,13 @@
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
 
+#include <functional>
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,9 +47,117 @@ namespace firebase_auth_windows {
 static std::string kLibraryName = "flutter-fire-auth";
 flutter::BinaryMessenger* FirebaseAuthPlugin::binaryMessenger = nullptr;
 
+namespace {
+
+constexpr wchar_t kTaskRunnerWindowClassName[] =
+    L"FirebaseAuthWindowsTaskRunnerWindow";
+constexpr UINT kTaskRunnerWindowMessage = WM_APP + 0x4673;
+
+class PlatformThreadDispatcher {
+ public:
+  static PlatformThreadDispatcher& GetInstance() {
+    static PlatformThreadDispatcher instance;
+    return instance;
+  }
+
+  void Initialize() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (window_ != nullptr) {
+      return;
+    }
+
+    platform_thread_id_ = GetCurrentThreadId();
+
+    WNDCLASSW window_class = {};
+    window_class.lpfnWndProc = PlatformThreadDispatcher::WindowProc;
+    window_class.hInstance = GetModuleHandle(nullptr);
+    window_class.lpszClassName = kTaskRunnerWindowClassName;
+
+    RegisterClassW(&window_class);
+    window_ =
+        CreateWindowExW(0, kTaskRunnerWindowClassName, L"", 0, 0, 0, 0, 0,
+                        HWND_MESSAGE, nullptr, window_class.hInstance, this);
+  }
+
+  void Post(std::function<void()> task) {
+    if (GetCurrentThreadId() == platform_thread_id_) {
+      task();
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks_.push(std::move(task));
+    }
+    PostMessageW(window_, kTaskRunnerWindowMessage, 0, 0);
+  }
+
+ private:
+  static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                                     LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+      auto create_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
+      SetWindowLongPtr(
+          window, GWLP_USERDATA,
+          reinterpret_cast<LONG_PTR>(create_struct->lpCreateParams));
+      return TRUE;
+    }
+
+    auto dispatcher = reinterpret_cast<PlatformThreadDispatcher*>(
+        GetWindowLongPtr(window, GWLP_USERDATA));
+    if (dispatcher != nullptr && message == kTaskRunnerWindowMessage) {
+      dispatcher->ProcessTasks();
+      return 0;
+    }
+
+    return DefWindowProc(window, message, wparam, lparam);
+  }
+
+  void ProcessTasks() {
+    std::queue<std::function<void()>> tasks;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks.swap(tasks_);
+    }
+
+    while (!tasks.empty()) {
+      tasks.front()();
+      tasks.pop();
+    }
+  }
+
+  PlatformThreadDispatcher() = default;
+
+  HWND window_ = nullptr;
+  DWORD platform_thread_id_ = 0;
+  std::mutex mutex_;
+  std::queue<std::function<void()>> tasks_;
+};
+
+struct EventSinkState {
+  std::mutex mutex;
+  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> events;
+  bool active = true;
+};
+
+void SendSuccessOnPlatformThread(std::shared_ptr<EventSinkState> state,
+                                 flutter::EncodableValue value) {
+  PlatformThreadDispatcher::GetInstance().Post(
+      [state = std::move(state), value = std::move(value)]() mutable {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->active && state->events) {
+          state->events->Success(value);
+        }
+      });
+}
+
+}  // namespace
+
 // static
 void FirebaseAuthPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
+  PlatformThreadDispatcher::GetInstance().Initialize();
+
   auto plugin = std::make_unique<FirebaseAuthPlugin>();
 
   FirebaseAuthHostApi::SetUp(registrar->messenger(), plugin.get());
@@ -313,7 +424,14 @@ class FlutterIdTokenListener : public firebase::auth::IdTokenListener {
  public:
   void SetEventSink(
       std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink) {
-    event_sink_ = std::move(event_sink);
+    std::lock_guard<std::mutex> lock(event_sink_state_->mutex);
+    event_sink_state_->events = std::move(event_sink);
+    event_sink_state_->active = event_sink_state_->events != nullptr;
+  }
+
+  bool HasEventSink() {
+    std::lock_guard<std::mutex> lock(event_sink_state_->mutex);
+    return event_sink_state_->active && event_sink_state_->events;
   }
 
   void OnIdTokenChanged(Auth* auth) override {
@@ -326,22 +444,23 @@ class FlutterIdTokenListener : public firebase::auth::IdTokenListener {
     using flutter::EncodableMap;
     using flutter::EncodableValue;
 
-    if (event_sink_) {
+    if (HasEventSink()) {
       if (user.is_valid()) {
         EncodableList userDetailsList = EncodableList();
         userDetailsList.push_back(userDetails.user_info().ToEncodableList());
         userDetailsList.push_back(userDetails.provider_data());
-        event_sink_->Success(EncodableValue(
+        SendSuccessOnPlatformThread(event_sink_state_, EncodableValue(
             EncodableMap{{EncodableValue("user"), userDetailsList}}));
       } else {
-        event_sink_->Success(EncodableValue(EncodableMap{
+        SendSuccessOnPlatformThread(event_sink_state_, EncodableValue(EncodableMap{
             {EncodableValue("user"), EncodableValue(std::monostate{})}}));
       }
     }
   }
 
  private:
-  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
+  std::shared_ptr<EventSinkState> event_sink_state_ =
+      std::make_shared<EventSinkState>();
 };
 
 class IdTokenStreamHandler
@@ -398,7 +517,14 @@ class FlutterAuthStateListener : public firebase::auth::AuthStateListener {
  public:
   void SetEventSink(
       std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink) {
-    event_sink_ = std::move(event_sink);
+    std::lock_guard<std::mutex> lock(event_sink_state_->mutex);
+    event_sink_state_->events = std::move(event_sink);
+    event_sink_state_->active = event_sink_state_->events != nullptr;
+  }
+
+  bool HasEventSink() {
+    std::lock_guard<std::mutex> lock(event_sink_state_->mutex);
+    return event_sink_state_->active && event_sink_state_->events;
   }
 
   void OnAuthStateChanged(Auth* auth) override {
@@ -411,23 +537,24 @@ class FlutterAuthStateListener : public firebase::auth::AuthStateListener {
     using flutter::EncodableMap;
     using flutter::EncodableValue;
 
-    if (event_sink_) {
+    if (HasEventSink()) {
       if (user.is_valid()) {
         EncodableList userDetailsList = EncodableList();
         userDetailsList.push_back(userDetails.user_info().ToEncodableList());
         userDetailsList.push_back(userDetails.provider_data());
 
-        event_sink_->Success(EncodableValue(
+        SendSuccessOnPlatformThread(event_sink_state_, EncodableValue(
             EncodableMap{{EncodableValue("user"), userDetailsList}}));
       } else {
-        event_sink_->Success(EncodableValue(EncodableMap{
+        SendSuccessOnPlatformThread(event_sink_state_, EncodableValue(EncodableMap{
             {EncodableValue("user"), EncodableValue(std::monostate{})}}));
       }
     }
   }
 
  private:
-  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
+  std::shared_ptr<EventSinkState> event_sink_state_ =
+      std::make_shared<EventSinkState>();
 };
 
 class AuthStateStreamHandler
